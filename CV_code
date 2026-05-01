@@ -1,0 +1,303 @@
+import cv2
+import numpy as np
+from google.colab.patches import cv2_imshow
+
+def get_coin_calibration_and_mask(image_path, reference_diameter_mm=23.25, show_image=True):
+    img = cv2.imread(image_path)
+    if img is None: return None, None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+
+    # 1. OTSU Threshold to separate solid objects from the background
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 2. Heavy Morphological CLOSE to fill in the coin's face so it becomes a solid blob
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    valid_coins = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > 1000: # Ignore background dust/noise
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0: continue
+
+            -
+            # Coin is a solid circle (~0.95+). Bar is a hollow C-shape (<0.6).
+            solidity = float(area) / hull_area
+            if solidity > 0.8:
+                valid_coins.append(c)
+
+    if not valid_coins:
+        print("Error: Could not find any solid circular objects. Ensure coin is visible.")
+        return None, None
+
+    # Out of the solid shapes found, grab the largest one (the coin)
+    coin_contour = max(valid_coins, key=cv2.contourArea)
+
+    # --- THE FIX: ELLIPSE MINOR AXIS (SHADOW IMMUNITY) ---
+    # A shadow stretches the blob in one direction. The perpendicular width
+    # remains the true, exact physical diameter of the coin!
+    if len(coin_contour) >= 5:
+        ellipse = cv2.fitEllipse(coin_contour)
+        (x_coin, y_coin), (d1, d2), angle = ellipse
+        diameter_pixels = min(d1, d2) # Grab the un-stretched width
+        radius_px = diameter_pixels / 2.0
+    else:
+        # Fallback just in case
+        (x_coin, y_coin), radius_px = cv2.minEnclosingCircle(coin_contour)
+        diameter_pixels = radius_px * 2
+
+    pixels_per_metric = diameter_pixels / reference_diameter_mm
+
+    # Package the mask (Radius x 1.3 ensures we erase the coin AND its shadow for Block 2)
+    coin_mask_data = (int(x_coin), int(y_coin), int(radius_px * 1.3))
+
+    if show_image:
+        cv2.circle(img, (int(x_coin), int(y_coin)), int(radius_px), (255, 0, 0), 2)
+        cv2.putText(img, f"Ratio: {pixels_per_metric:.2f} px/mm", (int(x_coin)-70, int(y_coin)-int(radius_px)-15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        print("--- STEP 1: COIN DETECTED (SOLIDITY + ELLIPSE) ---")
+        cv2_imshow(img)
+
+    return pixels_per_metric, coin_mask_data
+
+
+import cv2
+import numpy as np
+from scipy import optimize
+from google.colab.patches import cv2_imshow
+
+# ==========================================
+# 2. BAR ANALYSIS (HYBRID: CIRCLE + PARABOLA)
+# ==========================================
+def analyze_bent_bar_with_mask(image_path, pixels_per_metric=None, coin_mask_data=None, show_image=True):
+    img = cv2.imread(image_path)
+    if img is None: return None, None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 1. Macro-Vision Adaptive Thresholding (Ignores shadows and texture)
+    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 91, 10)
+
+    # Erase the coin
+    if coin_mask_data is not None:
+        mask_x, mask_y, mask_radius = coin_mask_data
+        cv2.circle(thresh, (mask_x, mask_y), mask_radius, 0, -1)
+
+    # Digital sandpaper to shave down 3D printing layer bumps
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None, None
+
+    img_height, img_width = img.shape[:2]
+    valid_bar_contours = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if x > 5 and y > 5 and (x + w) < (img_width - 5) and (y + h) < (img_height - 5):
+            if cv2.contourArea(c) > 500:
+                valid_bar_contours.append(c)
+
+    if not valid_bar_contours: return None, None
+
+    bar_contour = max(valid_bar_contours, key=cv2.contourArea)
+    points = np.squeeze(bar_contour)
+    if len(points.shape) < 2 or len(points) < 10: return None, None
+
+    x = points[:, 0]
+    y = points[:, 1]
+
+    # --- PRIMARY: TRUE LEAST-SQUARES CIRCLE FIT ---
+    def calc_R(xc, yc):
+        return np.sqrt((x - xc)**2 + (y - yc)**2)
+
+    def f_2(c):
+        Ri = calc_R(*c)
+        return Ri - Ri.mean()
+
+    center_estimate = (np.mean(x), np.mean(y))
+    center, _ = optimize.leastsq(f_2, center_estimate)
+    xc, yc = center
+    radius_pixels = calc_R(xc, yc).mean()
+
+    # ==============================================================
+    # GEAR 1: SHALLOW/WAVY BARS (DIGITAL SPIN PARABOLA FALLBACK)
+    # ==============================================================
+    # If the radius is massive (>2000 pixels), the circle math breaks down.
+    # It seamlessly switches to Parabola math to trace the shallow waves!
+    if radius_pixels > 2000:
+        M = cv2.moments(bar_contour)
+        cx = int(M['m10'] / M['m00']) if M['m00'] != 0 else np.mean(x)
+        cy = int(M['m01'] / M['m00']) if M['m00'] != 0 else np.mean(y)
+
+        # Spin the bar flat in memory
+        theta = 0.5 * np.arctan2(2 * M['mu11'], M['mu20'] - M['mu02'])
+        c_angle, s_angle = np.cos(-theta), np.sin(-theta)
+        R_mat = np.array(((c_angle, -s_angle), (s_angle, c_angle)))
+
+        centered_points = points - [cx, cy]
+        rotated_points = np.dot(centered_points, R_mat.T)
+
+        x_rot = rotated_points[:, 0]
+        y_rot = rotated_points[:, 1]
+        x_min, x_max = np.min(x_rot), np.max(x_rot)
+
+        # Fit Parabola
+        fit_coeffs = np.polyfit(x_rot, y_rot, 2)
+        A, B = fit_coeffs[0], fit_coeffs[1]
+
+        x_center = (np.min(x_rot) + np.max(x_rot)) / 2.0
+        y_center = np.polyval(fit_coeffs, x_center)
+
+        y_left, y_right = np.polyval(fit_coeffs, x_min), np.polyval(fit_coeffs, x_max)
+        vec1 = np.array([x_min - x_center, y_left - y_center])
+        vec2 = np.array([x_max - x_center, y_right - y_center])
+
+        # Calculate exact angle of the wavy line
+        cosine_angle = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-6)
+        deflection_angle_deg = 180.0 - np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+
+        y_prime = 2 * A * x_center + B
+        rad_px = ((1 + y_prime**2)**1.5) / (np.abs(2 * A) + 1e-6)
+        radius_real_world = rad_px / pixels_per_metric if pixels_per_metric else rad_px
+
+        if show_image:
+            cv2.drawContours(img, [bar_contour], -1, (0, 255, 0), 2)
+
+            # Spin the red visual curve back to the real-world diagonal tilt
+            x_plot = np.linspace(x_min, x_max, 100)
+            y_plot = np.polyval(fit_coeffs, x_plot)
+            curve_points = np.column_stack((x_plot, y_plot))
+
+            R_inv = np.array(((np.cos(theta), -np.sin(theta)), (np.sin(theta), np.cos(theta))))
+            original_curve_points = np.dot(curve_points, R_inv.T) + [cx, cy]
+
+            for i in range(len(original_curve_points)-1):
+                pt1 = (int(original_curve_points[i][0]), int(original_curve_points[i][1]))
+                pt2 = (int(original_curve_points[i+1][0]), int(original_curve_points[i+1][1]))
+                cv2.line(img, pt1, pt2, (0, 0, 255), 3)
+
+            cv2.putText(img, f"Radius: {radius_real_world:.2f} mm", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(img, f"Bend Angle: {deflection_angle_deg:.2f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2_imshow(img)
+
+        return radius_real_world, deflection_angle_deg
+
+    # ==============================================================
+    # GEAR 2: DEEP BENDS (CIRCLE MATH RESTORED)
+    # ==============================================================
+    radius_real_world = radius_pixels / pixels_per_metric if pixels_per_metric else radius_pixels
+
+    angles = np.arctan2(y - yc, x - xc)
+    sorted_angles = np.sort(angles)
+    gaps = np.diff(sorted_angles)
+    wrap_gap = (sorted_angles[0] + 2*np.pi) - sorted_angles[-1]
+    all_gaps = np.append(gaps, wrap_gap)
+
+    max_gap_idx = np.argmax(all_gaps)
+
+    if max_gap_idx < len(gaps):
+        start_angle = sorted_angles[max_gap_idx + 1]
+    else:
+        start_angle = sorted_angles[0]
+
+    sweep_angle_rad = 2 * np.pi - all_gaps[max_gap_idx]
+
+    mid_angle = start_angle + (sweep_angle_rad / 2.0)
+    end_angle = start_angle + sweep_angle_rad
+
+    belly_pt = np.array([xc + radius_pixels * np.cos(mid_angle), yc + radius_pixels * np.sin(mid_angle)])
+    tip1_pt = np.array([xc + radius_pixels * np.cos(start_angle), yc + radius_pixels * np.sin(start_angle)])
+    tip2_pt = np.array([xc + radius_pixels * np.cos(end_angle), yc + radius_pixels * np.sin(end_angle)])
+
+    vec1 = tip1_pt - belly_pt
+    vec2 = tip2_pt - belly_pt
+
+    cosine_angle = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+    deflection_angle_deg = 180.0 - np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+
+    if show_image:
+        cv2.drawContours(img, [bar_contour], -1, (0, 255, 0), 2)
+
+        arc_angles = start_angle + np.linspace(0, sweep_angle_rad, 100)
+        arc_x = xc + radius_pixels * np.cos(arc_angles)
+        arc_y = yc + radius_pixels * np.sin(arc_angles)
+
+        for i in range(len(arc_x)-1):
+            cv2.line(img, (int(arc_x[i]), int(arc_y[i])), (int(arc_x[i+1]), int(arc_y[i+1])), (0, 0, 255), 3)
+
+        cv2.putText(img, f"Radius: {radius_real_world:.2f} mm", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(img, f"Bend Angle: {deflection_angle_deg:.2f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2_imshow(img)
+
+    return radius_real_world, deflection_angle_deg
+
+import os
+import csv
+
+def export_to_csv(csv_filename, image_name, radius, angle):
+    print("\n=====================================")
+    print("   INPUT PRINT PARAMETERS FOR LOG")
+    print("=====================================")
+
+    # User Prompts (Now includes Nozzle Temp!)
+    length = input("Enter part Length (mm): ")
+    width = input("Enter part Width (mm): ")
+    thickness = input("Enter part Thickness (mm): ")
+    velocity_1 = input("Enter Top Layer Print Velocity (mm/s): ")
+    velocity_2 = input("Enter Bottom Layer Print Velocity (mm/s): ")
+    ratio = input("Enter Active/Passive Layer Ratio (e.g., 1.5): ")
+    nozzle_temp = input("Enter Nozzle Temperature (C): ")
+
+    # Check if the file exists to avoid writing headers twice
+    file_exists = os.path.isfile(csv_filename)
+
+    with open(csv_filename, mode='a', newline='') as file:
+        writer = csv.writer(file)
+
+        # Write the header row if this is a brand new file
+        if not file_exists:
+            writer.writerow([
+                "Image Name", "Length (mm)", "Width (mm)", "Thickness (mm)",
+                "Top Velocity (mm/s)", "Bottom Velocity (mm/s)",
+                "Active/Passive Ratio", "Nozzle Temp (C)", "Bend Radius (mm)", "Deflection Angle (deg)"
+            ])
+
+        # Write your actual data into the columns
+        writer.writerow([
+            image_name, length, width, thickness,
+            velocity_1, velocity_2,
+            ratio, nozzle_temp, f"{radius:.2f}", f"{angle:.2f}"
+        ])
+
+    print(f"\n>>> SUCCESS: Data for '{image_name}' saved to {csv_filename}! <<<")
+
+# ==========================================
+# FINAL EXECUTION PIPELINE
+# ==========================================
+# Setup your files
+my_image = "70deg_bentat90.tif"              # Update this if your file name changes!
+my_coin_diameter = 23.25                   # 23.25mm is a standard 1 Euro Coin
+database_name = "4D_Print_Data_Final.csv"  # The name of your spreadsheet
+
+print(">> STEP 1: Locating coin and calibrating scale...")
+conversion_factor, coin_mask = get_coin_calibration_and_mask(my_image, reference_diameter_mm=my_coin_diameter)
+
+if conversion_factor is not None and coin_mask is not None:
+    print("\n>> STEP 2: Erasing coin and analyzing bent bar...")
+    radius, angle = analyze_bent_bar_with_mask(my_image, conversion_factor, coin_mask)
+
+    if radius is not None:
+        print(f"\n>>> MEASUREMENTS COMPLETE -> Radius: {radius:.2f}mm | Angle: {angle:.2f}deg")
+
+        # >> STEP 3: Trigger the prompts and save to the database!
+        export_to_csv(database_name, my_image, radius, angle)
